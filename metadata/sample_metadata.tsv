@@ -1,0 +1,5 @@
+sample_id	condition	replicate
+sampleA	control	1
+sampleB	control	2
+sampleC	treated	1
+sampleD	treated	2

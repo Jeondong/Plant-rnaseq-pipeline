@@ -1,0 +1,209 @@
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tibble)
+  library(vsn)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+# Run DESeq2 using the combined featureCounts matrix and a sample metadata table.
+# Expects:
+#   - featureCounts output from step 05
+#   - Sample metadata TSV with row names matching count matrix column names
+# Produces:
+#   - DESeq2 result tables and QC plots in OUT_DIR
+
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- grep("^--file=", args, value = TRUE)
+if (length(file_arg) > 0) {
+  script_dir <- dirname(normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = FALSE))
+} else {
+  script_dir <- getwd()
+}
+default_project_dir <- if (basename(script_dir) == "scripts") dirname(script_dir) else script_dir
+project_dir <- Sys.getenv("PROJECT_DIR", default_project_dir)
+
+count_file <- Sys.getenv("COUNT_FILE", file.path(project_dir, "results/05_featurecounts/gene_counts.txt"))
+sample_table <- Sys.getenv("SAMPLE_TABLE", file.path(project_dir, "metadata/sample_metadata.tsv"))
+out_dir <- Sys.getenv("OUT_DIR", file.path(project_dir, "results/06_deseq2"))
+design_formula_text <- Sys.getenv("DESIGN_FORMULA", "~ condition")
+reference_level <- Sys.getenv("REFERENCE_LEVEL", "")
+contrast_column <- Sys.getenv("CONTRAST_COLUMN", "condition")
+contrast_test <- Sys.getenv("CONTRAST_TEST", "")
+contrast_ref <- Sys.getenv("CONTRAST_REF", "")
+alpha <- as.numeric(Sys.getenv("ALPHA", "0.05"))
+lfc_cutoff <- as.numeric(Sys.getenv("LFC_CUTOFF", "1"))
+padj_cutoff <- as.numeric(Sys.getenv("PADJ_CUTOFF", "0.05"))
+top_n_heatmap <- as.integer(Sys.getenv("TOP_N_HEATMAP", "20"))
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+counts_df <- read.table(
+  count_file,
+  header = TRUE,
+  sep = "\t",
+  comment.char = "#",
+  quote = "",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+if (!all(c("Geneid", "Chr", "Start", "End", "Strand", "Length") %in% colnames(counts_df))) {
+  stop("featureCounts file does not have the expected annotation columns.")
+}
+
+count_matrix <- counts_df[, !(colnames(counts_df) %in% c("Chr", "Start", "End", "Strand", "Length")), drop = FALSE]
+rownames(count_matrix) <- count_matrix$Geneid
+count_matrix$Geneid <- NULL
+colnames(count_matrix) <- sub("\\.sorted\\.bam$", "", basename(colnames(count_matrix)))
+count_matrix <- as.matrix(count_matrix)
+storage.mode(count_matrix) <- "integer"
+
+coldata <- read.table(
+  sample_table,
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = TRUE
+)
+
+missing_samples <- setdiff(colnames(count_matrix), rownames(coldata))
+if (length(missing_samples) > 0) {
+  stop(sprintf(
+    "Sample metadata is missing rows for: %s",
+    paste(missing_samples, collapse = ", ")
+  ))
+}
+
+coldata <- coldata[colnames(count_matrix), , drop = FALSE]
+
+design_formula <- as.formula(design_formula_text)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = coldata,
+  design = design_formula
+)
+
+if (reference_level != "") {
+  if (!(contrast_column %in% colnames(coldata))) {
+    stop(sprintf("contrast column '%s' is not present in sample metadata.", contrast_column))
+  }
+  dds[[contrast_column]] <- relevel(dds[[contrast_column]], ref = reference_level)
+}
+
+dds <- DESeq(dds)
+
+plot_groups <- intersect(c("condition", contrast_column), colnames(coldata))
+if (length(plot_groups) == 0) {
+  plot_groups <- colnames(coldata)[1]
+}
+
+if (contrast_test != "" && contrast_ref != "") {
+  res <- results(dds, contrast = c(contrast_column, contrast_test, contrast_ref), alpha = alpha)
+  result_prefix <- sprintf("%s_%s_vs_%s", contrast_column, contrast_test, contrast_ref)
+} else {
+  res <- results(dds, alpha = alpha)
+  result_prefix <- "default_results"
+}
+
+res_df <- as.data.frame(res)
+res_df <- rownames_to_column(res_df, "gene_id")
+write.csv(
+  res_df,
+  file = file.path(out_dir, paste0(result_prefix, ".csv")),
+  row.names = FALSE
+)
+
+norm_counts <- counts(dds, normalized = TRUE)
+write.csv(
+  data.frame(gene_id = rownames(norm_counts), norm_counts, check.names = FALSE),
+  file = file.path(out_dir, "normalized_counts.csv"),
+  row.names = FALSE
+)
+
+vsd <- vst(dds, blind = FALSE)
+
+pdf(file.path(out_dir, "MA_plot.pdf"))
+plotMA(res, ylim = c(-2, 2))
+dev.off()
+
+if (nrow(res_df) > 0 && any(!is.na(res$padj))) {
+  best_gene <- rownames(res)[which.min(replace(res$padj, is.na(res$padj), Inf))]
+  pdf(file.path(out_dir, "plotCounts_top_gene.pdf"))
+  plotCounts(dds, gene = best_gene, intgroup = plot_groups)
+  dev.off()
+}
+
+pdf(file.path(out_dir, "mean_sd_plot.pdf"))
+meanSdPlot(assay(vsd))
+dev.off()
+
+top_n_heatmap <- min(top_n_heatmap, nrow(norm_counts))
+if (top_n_heatmap > 1) {
+  select <- order(rowMeans(norm_counts), decreasing = TRUE)[seq_len(top_n_heatmap)]
+  annotation_df <- as.data.frame(colData(dds))
+
+  pdf(file.path(out_dir, "top_genes_heatmap.pdf"))
+  pheatmap(
+    assay(vsd)[select, , drop = FALSE],
+    show_rownames = FALSE,
+    annotation_col = annotation_df
+  )
+  dev.off()
+}
+
+sample_dists <- dist(t(assay(vsd)))
+sample_dist_matrix <- as.matrix(sample_dists)
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+pdf(file.path(out_dir, "sample_distance_heatmap.pdf"))
+pheatmap(
+  sample_dist_matrix,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  col = colors
+)
+dev.off()
+
+pdf(file.path(out_dir, "PCA_plot.pdf"))
+plotPCA(vsd, intgroup = plot_groups)
+dev.off()
+
+pdf(file.path(out_dir, "cooks_distance_boxplot.pdf"))
+par(mar = c(8, 5, 2, 2))
+boxplot(log10(assays(dds)[["cooks"]]), range = 0, las = 2)
+dev.off()
+
+topT <- as.data.frame(res)
+
+pdf(file.path(out_dir, "volcano_plot.pdf"))
+par(mar = c(5, 5, 5, 5))
+with(
+  topT,
+  plot(
+    log2FoldChange,
+    -log10(padj),
+    pch = 20,
+    main = "Volcano plot",
+    col = "grey",
+    xlab = expression(Log[2] ~ fold ~ change),
+    ylab = expression(-Log[10] ~ adjusted ~ p ~ value)
+  )
+)
+with(
+  subset(topT, !is.na(padj) & padj < padj_cutoff & log2FoldChange > lfc_cutoff),
+  points(log2FoldChange, -log10(padj), pch = 20, col = "red")
+)
+with(
+  subset(topT, !is.na(padj) & padj < padj_cutoff & log2FoldChange < (-lfc_cutoff)),
+  points(log2FoldChange, -log10(padj), pch = 20, col = "blue")
+)
+abline(v = 0, col = "black", lty = 3)
+abline(v = -lfc_cutoff, col = "black", lty = 4)
+abline(v = lfc_cutoff, col = "black", lty = 4)
+abline(h = -log10(padj_cutoff), col = "black", lty = 4)
+dev.off()
